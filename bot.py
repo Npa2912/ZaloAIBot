@@ -1306,26 +1306,167 @@ async def handle_message(
 
 
 # =========================================================
+# STARTUP
+# =========================================================
+
+async def post_init(application):
+    """
+    Chạy sau khi Zalo Application khởi tạo thành công.
+
+    Mục đích:
+    - xác nhận polling đã thực sự chạy
+    - khôi phục các reminder PENDING sau khi Render restart
+    """
+
+    print(
+        "🚀 Zalo polling đã khởi động",
+        flush=True
+    )
+
+    try:
+        await restore_reminders(
+            application.bot
+        )
+
+        print(
+            "✅ Restore reminder hoàn tất",
+            flush=True
+        )
+
+    except Exception as e:
+        print(
+            f"❌ Restore reminder startup lỗi: {e}",
+            flush=True
+        )
+
+
+# =========================================================
+# GLOBAL ERROR HANDLER
+# =========================================================
+
+async def error_handler(
+    update,
+    context
+):
+    """
+    Bắt lỗi toàn cục để polling không im lặng khi có exception.
+    """
+
+    print(
+        "==========================================",
+        flush=True
+    )
+
+    print(
+        f"❌ ZALO BOT ERROR: {context.error}",
+        flush=True
+    )
+
+    print(
+        f"UPDATE: {update}",
+        flush=True
+    )
+
+    print(
+        "==========================================",
+        flush=True
+    )
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
 if __name__ == "__main__":
 
-    # HTTP server Render
-    threading.Thread(
-        target=run_web_server,
-        daemon=True
-    ).start()
-
-    # Database
-    init_db()
-
-    # Zalo
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .build()
+    print()
+    print(
+        "🚀 Đang khởi động Zalo AI Bot...",
+        flush=True
     )
+
+    # =====================================================
+    # DATABASE
+    # =====================================================
+
+    try:
+        init_db()
+
+        print(
+            "✅ Database OK",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ Database startup error: {e}",
+            flush=True
+        )
+
+        raise
+
+
+    # =====================================================
+    # HTTP SERVER FOR RENDER
+    # =====================================================
+
+    try:
+
+        web_thread = threading.Thread(
+            target=run_web_server,
+            daemon=True,
+            name="RenderHTTPServer"
+        )
+
+        web_thread.start()
+
+        print(
+            "✅ HTTP server thread started",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ HTTP server startup error: {e}",
+            flush=True
+        )
+
+        raise
+
+
+    # =====================================================
+    # ZALO APPLICATION
+    # =====================================================
+
+    try:
+
+        app = (
+            ApplicationBuilder()
+            .token(BOT_TOKEN)
+            .post_init(post_init)
+            .build()
+        )
+
+        print(
+            "✅ Zalo Application created",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ Zalo Application startup error: {e}",
+            flush=True
+        )
+
+        raise
+
+
+    # =====================================================
+    # COMMAND: /start
+    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -1334,6 +1475,11 @@ if __name__ == "__main__":
         )
     )
 
+
+    # =====================================================
+    # COMMAND: /about
+    # =====================================================
+
     app.add_handler(
         CommandHandler(
             "about",
@@ -1341,12 +1487,22 @@ if __name__ == "__main__":
         )
     )
 
+
+    # =====================================================
+    # COMMAND: /restore
+    # =====================================================
+
     app.add_handler(
         CommandHandler(
             "restore",
             restore_command
         )
     )
+
+
+    # =====================================================
+    # NORMAL TEXT MESSAGE
+    # =====================================================
 
     app.add_handler(
         MessageHandler(
@@ -1356,40 +1512,124 @@ if __name__ == "__main__":
         )
     )
 
+
+    # =====================================================
+    # GLOBAL ERROR HANDLER
+    # =====================================================
+
+    app.add_error_handler(
+        error_handler
+    )
+
+
+    # =====================================================
+    # STARTUP INFORMATION
+    # =====================================================
+
     print()
     print(
-        "=========================================="
+        "==========================================",
+        flush=True
     )
+
     print(
-        f"🤖 {BOT_NAME} v2.0"
+        f"🤖 {BOT_NAME} v2.1",
+        flush=True
     )
+
     print(
-        f"👨‍💻 Developer: {DEVELOPER}"
+        f"👨‍💻 Developer: {DEVELOPER}",
+        flush=True
     )
+
     print(
-        "🧠 Smart Context        : ON"
+        "🧠 Smart Context        : ON",
+        flush=True
     )
+
     print(
-        "🧠 Long-term Memory     : ON"
+        "🧠 Long-term Memory     : ON",
+        flush=True
     )
+
     print(
-        "❓ Clarification        : ON"
+        "❓ Clarification        : ON",
+        flush=True
     )
+
     print(
-        "⏰ Smart Reminder       : ON"
+        "⏰ Smart Reminder       : ON",
+        flush=True
     )
+
     print(
-        "⚡ Groq                 : ON"
+        "♻️ Reminder Restore     : ON",
+        flush=True
     )
+
     print(
-        "🌐 Render               : ON"
+        "⚡ Groq                 : ON",
+        flush=True
     )
+
     print(
-        "=========================================="
+        "🌐 Render HTTP Server   : ON",
+        flush=True
     )
+
     print(
-        COPYRIGHT
+        "📡 Zalo Polling         : STARTING",
+        flush=True
     )
+
+    print(
+        "==========================================",
+        flush=True
+    )
+
+    print(
+        COPYRIGHT,
+        flush=True
+    )
+
     print()
 
-    app.run_polling()
+
+    # =====================================================
+    # START POLLING
+    # =====================================================
+
+    try:
+
+        print(
+            "📡 Bắt đầu Zalo polling...",
+            flush=True
+        )
+
+        app.run_polling()
+
+    except KeyboardInterrupt:
+
+        print(
+            "🛑 Bot stopped by user.",
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            "==========================================",
+            flush=True
+        )
+
+        print(
+            f"❌ POLLING FATAL ERROR: {e}",
+            flush=True
+        )
+
+        print(
+            "==========================================",
+            flush=True
+        )
+
+        raise

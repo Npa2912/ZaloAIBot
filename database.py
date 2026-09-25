@@ -5,18 +5,17 @@ DB_NAME = "reminders.db"
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 # =========================================================
-# INIT DATABASE
+# INIT
 # =========================================================
 
 def init_db():
     with get_conn() as conn:
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS reminders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,6 +45,20 @@ def init_db():
             )
         """)
 
+        # Dùng để giữ hội thoại đang chờ bổ sung thông tin.
+        # VD:
+        # user: "mai nhắc t đi học"
+        # bot:  "Mấy giờ?"
+        # pending_state lưu intent cho đến khi user trả lời "7h"
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_states (
+                user_id TEXT PRIMARY KEY,
+                action TEXT NOT NULL,
+                data TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_messages_user
             ON messages(user_id, id)
@@ -57,22 +70,20 @@ def init_db():
         """)
 
         conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_reminders_status
-            ON reminders(status, remind_at)
+            CREATE INDEX IF NOT EXISTS idx_reminders_user
+            ON reminders(user_id, status, remind_at)
         """)
 
         conn.commit()
 
 
 # =========================================================
-# REMINDERS
+# REMINDER
 # =========================================================
 
 def add_reminder(user_id, remind_at, content):
-
     with get_conn() as conn:
-
-        cursor = conn.execute("""
+        cur = conn.execute("""
             INSERT INTO reminders
             (user_id, remind_at, content, status)
             VALUES (?, ?, ?, 'PENDING')
@@ -83,14 +94,39 @@ def add_reminder(user_id, remind_at, content):
         ))
 
         conn.commit()
+        return cur.lastrowid
 
-        return cursor.lastrowid
+
+def get_reminder_by_id(reminder_id, user_id=None):
+    with get_conn() as conn:
+        if user_id is None:
+            row = conn.execute("""
+                SELECT id, user_id, remind_at, content, status
+                FROM reminders
+                WHERE id = ?
+                LIMIT 1
+            """, (reminder_id,)).fetchone()
+
+        else:
+            row = conn.execute("""
+                SELECT id, user_id, remind_at, content, status
+                FROM reminders
+                WHERE id = ?
+                  AND user_id = ?
+                LIMIT 1
+            """, (
+                reminder_id,
+                str(user_id)
+            )).fetchone()
+
+    if not row:
+        return None
+
+    return dict(row)
 
 
 def get_last_reminder(user_id):
-
     with get_conn() as conn:
-
         row = conn.execute("""
             SELECT id, remind_at, content
             FROM reminders
@@ -98,9 +134,7 @@ def get_last_reminder(user_id):
               AND status = 'PENDING'
             ORDER BY id DESC
             LIMIT 1
-        """, (
-            str(user_id),
-        )).fetchone()
+        """, (str(user_id),)).fetchone()
 
     if not row:
         return None
@@ -113,18 +147,14 @@ def get_last_reminder(user_id):
 
 
 def get_user_reminders(user_id):
-
     with get_conn() as conn:
-
         rows = conn.execute("""
             SELECT id, remind_at, content
             FROM reminders
             WHERE user_id = ?
               AND status = 'PENDING'
-            ORDER BY remind_at
-        """, (
-            str(user_id),
-        )).fetchall()
+            ORDER BY remind_at ASC
+        """, (str(user_id),)).fetchall()
 
     return [
         (
@@ -136,25 +166,13 @@ def get_user_reminders(user_id):
     ]
 
 
-# =========================================================
-# QUAN TRỌNG:
-# LẤY TOÀN BỘ REMINDER CHƯA GỬI
-# DÙNG KHI SERVER KHỞI ĐỘNG LẠI
-# =========================================================
-
 def get_pending_reminders():
-
     with get_conn() as conn:
-
         rows = conn.execute("""
-            SELECT
-                id,
-                user_id,
-                remind_at,
-                content
+            SELECT id, user_id, remind_at, content
             FROM reminders
             WHERE status = 'PENDING'
-            ORDER BY remind_at
+            ORDER BY remind_at ASC
         """).fetchall()
 
     return [
@@ -168,51 +186,49 @@ def get_pending_reminders():
     ]
 
 
-def update_reminder(
-    reminder_id,
-    remind_at
-):
-
+def update_reminder(reminder_id, remind_at, content=None):
     with get_conn() as conn:
-
-        conn.execute("""
-            UPDATE reminders
-            SET remind_at = ?
-            WHERE id = ?
-        """, (
-            remind_at,
-            reminder_id
-        ))
+        if content is None:
+            conn.execute("""
+                UPDATE reminders
+                SET remind_at = ?
+                WHERE id = ?
+            """, (
+                remind_at,
+                reminder_id
+            ))
+        else:
+            conn.execute("""
+                UPDATE reminders
+                SET remind_at = ?, content = ?
+                WHERE id = ?
+            """, (
+                remind_at,
+                content,
+                reminder_id
+            ))
 
         conn.commit()
 
 
 def cancel_reminder(reminder_id):
-
     with get_conn() as conn:
-
         conn.execute("""
             UPDATE reminders
             SET status = 'CANCELLED'
             WHERE id = ?
-        """, (
-            reminder_id,
-        ))
+        """, (reminder_id,))
 
         conn.commit()
 
 
 def mark_done(reminder_id):
-
     with get_conn() as conn:
-
         conn.execute("""
             UPDATE reminders
             SET status = 'DONE'
             WHERE id = ?
-        """, (
-            reminder_id,
-        ))
+        """, (reminder_id,))
 
         conn.commit()
 
@@ -221,40 +237,27 @@ def mark_done(reminder_id):
 # CHAT HISTORY
 # =========================================================
 
-def save_message(
-    user_id,
-    role,
-    content
-):
+def save_message(user_id, role, content):
+    if not content:
+        return
 
     with get_conn() as conn:
-
         conn.execute("""
             INSERT INTO messages
-            (
-                user_id,
-                role,
-                content,
-                created_at
-            )
+            (user_id, role, content, created_at)
             VALUES (?, ?, ?, ?)
         """, (
             str(user_id),
             role,
-            content,
+            str(content),
             datetime.now().isoformat()
         ))
 
         conn.commit()
 
 
-def get_recent_messages(
-    user_id,
-    limit=16
-):
-
+def get_recent_messages(user_id, limit=24):
     with get_conn() as conn:
-
         rows = conn.execute("""
             SELECT role, content
             FROM messages
@@ -263,12 +266,10 @@ def get_recent_messages(
             LIMIT ?
         """, (
             str(user_id),
-            limit
+            int(limit)
         )).fetchall()
 
-    rows = list(
-        reversed(rows)
-    )
+    rows = list(reversed(rows))
 
     return [
         {
@@ -280,35 +281,26 @@ def get_recent_messages(
 
 
 def clear_chat_history(user_id):
-
     with get_conn() as conn:
-
         conn.execute("""
             DELETE FROM messages
             WHERE user_id = ?
-        """, (
-            str(user_id),
-        ))
+        """, (str(user_id),))
 
         conn.commit()
 
 
 # =========================================================
-# LONG TERM MEMORY
+# LONG-TERM MEMORY
 # =========================================================
 
-def add_memory(
-    user_id,
-    content
-):
-
-    content = content.strip()
+def add_memory(user_id, content):
+    content = str(content).strip()
 
     if not content:
-        return
+        return False
 
     with get_conn() as conn:
-
         exists = conn.execute("""
             SELECT id
             FROM memories
@@ -321,15 +313,11 @@ def add_memory(
         )).fetchone()
 
         if exists:
-            return
+            return False
 
         conn.execute("""
             INSERT INTO memories
-            (
-                user_id,
-                content,
-                created_at
-            )
+            (user_id, content, created_at)
             VALUES (?, ?, ?)
         """, (
             str(user_id),
@@ -339,14 +327,11 @@ def add_memory(
 
         conn.commit()
 
+    return True
 
-def get_memories(
-    user_id,
-    limit=20
-):
 
+def get_memories(user_id, limit=30):
     with get_conn() as conn:
-
         rows = conn.execute("""
             SELECT content
             FROM memories
@@ -355,7 +340,7 @@ def get_memories(
             LIMIT ?
         """, (
             str(user_id),
-            limit
+            int(limit)
         )).fetchall()
 
     return [
@@ -365,14 +350,65 @@ def get_memories(
 
 
 def clear_memories(user_id):
-
     with get_conn() as conn:
-
         conn.execute("""
             DELETE FROM memories
             WHERE user_id = ?
+        """, (str(user_id),))
+
+        conn.commit()
+
+
+# =========================================================
+# PENDING CONVERSATION STATE
+# =========================================================
+
+def set_pending_state(user_id, action, data=""):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO pending_states
+            (user_id, action, data, created_at)
+            VALUES (?, ?, ?, ?)
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                action = excluded.action,
+                data = excluded.data,
+                created_at = excluded.created_at
         """, (
             str(user_id),
+            action,
+            data or "",
+            datetime.now().isoformat()
         ))
+
+        conn.commit()
+
+
+def get_pending_state(user_id):
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT action, data, created_at
+            FROM pending_states
+            WHERE user_id = ?
+            LIMIT 1
+        """, (str(user_id),)).fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "action": row["action"],
+        "data": row["data"],
+        "created_at": row["created_at"]
+    }
+
+
+def clear_pending_state(user_id):
+    with get_conn() as conn:
+        conn.execute("""
+            DELETE FROM pending_states
+            WHERE user_id = ?
+        """, (str(user_id),))
 
         conn.commit()

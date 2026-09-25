@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import asyncio
 import threading
 
@@ -20,44 +21,57 @@ from zalo_bot.ext import (
 
 from database import (
     init_db,
+
     add_reminder,
     get_last_reminder,
+    get_reminder_by_id,
     get_user_reminders,
     get_pending_reminders,
     update_reminder,
     cancel_reminder,
     mark_done,
+
     save_message,
     get_recent_messages,
+    clear_chat_history,
+
     add_memory,
     get_memories,
     clear_memories,
-    clear_chat_history,
+
+    set_pending_state,
+    get_pending_state,
+    clear_pending_state,
 )
 
 from ai_service import (
     chat_with_ai,
     understand_reminder,
     extract_explicit_memory,
+    BOT_NAME,
+    DEVELOPER,
+    COPYRIGHT,
 )
 
 
 # =========================================================
-# ENV
+# CONFIG
 # =========================================================
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("ZALO_BOT_TOKEN")
+BOT_TOKEN = os.getenv(
+    "ZALO_BOT_TOKEN"
+)
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "❌ Thiếu ZALO_BOT_TOKEN trong Environment Variables hoặc .env"
+        "❌ Thiếu ZALO_BOT_TOKEN."
     )
 
 
 # =========================================================
-# WEB SERVER CHO RENDER
+# RENDER HTTP SERVER
 # =========================================================
 
 web_app = Flask(__name__)
@@ -67,7 +81,9 @@ web_app = Flask(__name__)
 def home():
     return {
         "status": "online",
-        "service": "Zalo Personal AI"
+        "service": BOT_NAME,
+        "developer": DEVELOPER,
+        "version": "2.0"
     }, 200
 
 
@@ -86,7 +102,7 @@ def run_web_server():
     )
 
     print(
-        f"🌐 HTTP server chạy port {port}"
+        f"🌐 HTTP server port {port}"
     )
 
     web_app.run(
@@ -105,7 +121,7 @@ running_tasks = {}
 
 async def reminder_task(
     bot,
-    chat_id,
+    user_id,
     reminder_id,
     run_time,
     content
@@ -113,26 +129,27 @@ async def reminder_task(
 
     try:
 
-        seconds = (
-            run_time - datetime.now()
+        delay = (
+            run_time -
+            datetime.now()
         ).total_seconds()
 
-        if seconds > 0:
+        if delay > 0:
 
             print(
-                f"⏳ Reminder #{reminder_id} "
-                f"còn {int(seconds)} giây"
+                f"⏳ Reminder #{reminder_id}: "
+                f"{int(delay)}s"
             )
 
             await asyncio.sleep(
-                seconds
+                delay
             )
 
-        # Chủ động gửi tin nhắn.
-        # Không phụ thuộc update.message.
         await bot.send_message(
-            chat_id=str(chat_id),
-            text=f"🔔 Đến giờ {content} rồi!"
+            chat_id=str(user_id),
+            text=(
+                f"🔔 Đến giờ {content} rồi!"
+            )
         )
 
         mark_done(
@@ -145,51 +162,46 @@ async def reminder_task(
         )
 
         print(
-            f"✅ Reminder #{reminder_id} "
-            f"đã gửi: {content}"
+            f"✅ Reminder #{reminder_id} sent"
         )
 
     except asyncio.CancelledError:
 
         print(
-            f"🚫 Reminder #{reminder_id} "
-            f"đã bị hủy"
+            f"🚫 Reminder #{reminder_id} cancelled"
         )
 
     except Exception as e:
-
-        # Không mark DONE nếu gửi lỗi.
-        # Lịch vẫn PENDING trong DB.
-        print(
-            f"❌ Reminder #{reminder_id}: {e}"
-        )
 
         running_tasks.pop(
             reminder_id,
             None
         )
 
+        print(
+            f"❌ Reminder #{reminder_id}: {e}"
+        )
+
 
 def schedule_reminder(
     bot,
-    chat_id,
+    user_id,
     reminder_id,
     run_time,
     content
 ):
 
-    old_task = running_tasks.get(
+    old = running_tasks.get(
         reminder_id
     )
 
-    if old_task:
-
-        old_task.cancel()
+    if old:
+        old.cancel()
 
     task = asyncio.create_task(
         reminder_task(
             bot,
-            chat_id,
+            user_id,
             reminder_id,
             run_time,
             content
@@ -201,82 +213,53 @@ def schedule_reminder(
     ] = task
 
     print(
-        f"⏰ Scheduled #{reminder_id}: "
-        f"{run_time.strftime('%d/%m/%Y %H:%M:%S')} "
-        f"- {content}"
+        f"⏰ #{reminder_id} "
+        f"{run_time.strftime('%d/%m/%Y %H:%M')} "
+        f"{content}"
     )
 
 
 # =========================================================
-# RESTORE REMINDER
+# RESTORE
 # =========================================================
 
 async def restore_reminders(bot):
 
-    reminders = (
-        get_pending_reminders()
-    )
+    rows = get_pending_reminders()
 
-    print()
-    print("==============================")
     print(
-        f"♻️ PENDING reminders: {len(reminders)}"
+        f"♻️ Restore {len(rows)} reminders"
     )
-
-    restored = 0
-    missed = 0
 
     for (
         reminder_id,
         user_id,
         remind_at,
         content
-    ) in reminders:
+    ) in rows:
 
         try:
 
-            run_time = (
-                datetime.fromisoformat(
-                    remind_at
-                )
+            run_time = datetime.fromisoformat(
+                remind_at
             )
-
-            # ---------------------------------------------
-            # ĐÃ QUÁ GIỜ
-            # ---------------------------------------------
 
             if run_time <= datetime.now():
 
-                try:
-
-                    await bot.send_message(
-                        chat_id=str(user_id),
-                        text=(
-                            "⚠️ Bạn có một lời nhắc bị lỡ "
-                            "trong lúc bot offline:\n\n"
-                            f"🔔 {content}\n"
-                            f"⏰ {run_time.strftime('%d/%m/%Y %H:%M')}"
-                        )
+                await bot.send_message(
+                    chat_id=str(user_id),
+                    text=(
+                        "⚠️ Bạn có lời nhắc bị lỡ:\n"
+                        f"🔔 {content}\n"
+                        f"⏰ {run_time.strftime('%d/%m %H:%M')}"
                     )
+                )
 
-                    mark_done(
-                        reminder_id
-                    )
-
-                    missed += 1
-
-                except Exception as e:
-
-                    print(
-                        f"❌ Không gửi được reminder "
-                        f"quá hạn #{reminder_id}: {e}"
-                    )
+                mark_done(
+                    reminder_id
+                )
 
                 continue
-
-            # ---------------------------------------------
-            # CHƯA TỚI GIỜ
-            # ---------------------------------------------
 
             schedule_reminder(
                 bot,
@@ -286,140 +269,121 @@ async def restore_reminders(bot):
                 content
             )
 
-            restored += 1
-
         except Exception as e:
 
             print(
                 f"❌ Restore #{reminder_id}: {e}"
             )
 
-    print(
-        f"♻️ Restored: {restored}"
-    )
 
-    print(
-        f"⚠️ Missed: {missed}"
-    )
+# =========================================================
+# HELPERS
+# =========================================================
 
-    print("==============================")
-    print()
+def parse_datetime(value):
+
+    if isinstance(
+        value,
+        datetime
+    ):
+        return value
+
+    if not value:
+        return None
+
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M"
+    ]
+
+    for fmt in formats:
+
+        try:
+
+            return datetime.strptime(
+                value,
+                fmt
+            )
+
+        except ValueError:
+            pass
+
+    try:
+        return datetime.fromisoformat(
+            value
+        )
+
+    except Exception:
+        return None
+
+
+async def send_long_message(
+    message,
+    text
+):
+
+    if not text:
+        return
+
+    chunk_size = 2800
+
+    for i in range(
+        0,
+        len(text),
+        chunk_size
+    ):
+
+        await message.reply_text(
+            text[
+                i:i + chunk_size
+            ]
+        )
+
+
+def looks_like_reminder(text):
+
+    lower = text.lower()
+
+    keywords = [
+        "nhắc",
+        "nhắc t",
+        "nhắc tôi",
+        "báo t",
+        "báo tôi",
+        "kêu t",
+        "kêu tôi",
+        "lịch",
+        "hủy lịch",
+        "huỷ lịch",
+        "đổi lịch",
+        "sửa lịch",
+        "mai có gì",
+        "mai t có gì",
+        "mai tôi có gì",
+    ]
+
+    return any(
+        x in lower
+        for x in keywords
+    )
 
 
 # =========================================================
-# LOCAL ROUTER
+# FAST LOCAL REMINDER
 # =========================================================
 
-def local_router(text):
+def fast_reminder(text):
 
-    lower = (
-        text
-        .lower()
-        .strip()
-    )
+    lower = text.lower().strip()
 
-    # =====================================================
-    # MEMORY
-    # =====================================================
-
-    memory_show = [
-        "bạn nhớ gì về tôi",
-        "m nhớ gì về t",
-        "mày nhớ gì về tao",
-        "nhớ gì về tôi",
-        "nhớ gì về t",
-        "xem bộ nhớ",
-    ]
-
-    if lower in memory_show:
-
-        return {
-            "action": "SHOW_MEMORY"
-        }
-
-    memory_clear = [
-        "xóa bộ nhớ",
-        "xoá bộ nhớ",
-        "quên hết đi",
-        "xóa những gì đã nhớ",
-        "xoá những gì đã nhớ",
-    ]
-
-    if lower in memory_clear:
-
-        return {
-            "action": "CLEAR_MEMORY"
-        }
-
-    history_clear = [
-        "xóa lịch sử chat",
-        "xoá lịch sử chat",
-        "reset cuộc trò chuyện",
-        "reset chat",
-    ]
-
-    if lower in history_clear:
-
-        return {
-            "action": "CLEAR_HISTORY"
-        }
-
-    # =====================================================
-    # XEM LỊCH
-    # =====================================================
-
-    list_patterns = [
-        "xem lịch",
-        "lịch của tôi",
-        "lịch của t",
-        "tôi có lịch gì",
-        "t có lịch gì",
-        "t có lịch j",
-        "có lịch gì",
-        "có lịch j",
-        "mai t có lịch",
-        "mai tôi có lịch",
-        "mai có lịch",
-    ]
-
-    if any(
-        p in lower
-        for p in list_patterns
-    ):
-
-        return {
-            "action": "LIST_REMINDER"
-        }
-
-    # =====================================================
-    # HỦY
-    # =====================================================
-
-    if (
-        (
-            "hủy" in lower
-            or "huỷ" in lower
-        )
-        and (
-            "lịch" in lower
-            or "nhắc" in lower
-            or "cái vừa rồi" in lower
-            or "nó" in lower
-        )
-    ):
-
-        return {
-            "action": "CANCEL_REMINDER"
-        }
-
-    # =====================================================
+    # -----------------------------------------------------
     # X PHÚT NỮA
-    # =====================================================
+    # -----------------------------------------------------
 
     match = re.search(
         r"(\d+)\s*phút\s*nữa.*?"
-        r"(?:nhắc|kêu|báo)\s*"
-        r"(?:tôi|t|tao|mình)?\s*(.*)",
+        r"(?:nhắc|báo|kêu)\s*"
+        r"(?:tôi|t|tao|mình)?\s*(.+)",
         lower,
         re.I
     )
@@ -431,31 +395,29 @@ def local_router(text):
         )
 
         content = (
-            match.group(2).strip()
-            or "làm việc"
-        )
-
-        run_time = (
-            datetime.now()
-            + timedelta(
-                minutes=minutes
-            )
+            match.group(2)
+            .strip()
         )
 
         return {
             "action": "CREATE_REMINDER",
-            "datetime": run_time,
+            "datetime": (
+                datetime.now()
+                + timedelta(
+                    minutes=minutes
+                )
+            ),
             "content": content
         }
 
-    # =====================================================
+    # -----------------------------------------------------
     # X GIỜ NỮA
-    # =====================================================
+    # -----------------------------------------------------
 
     match = re.search(
-        r"(\d+)\s*(?:tiếng|giờ)\s*nữa.*?"
-        r"(?:nhắc|kêu|báo)\s*"
-        r"(?:tôi|t|tao|mình)?\s*(.*)",
+        r"(\d+)\s*(?:giờ|tiếng)\s*nữa.*?"
+        r"(?:nhắc|báo|kêu)\s*"
+        r"(?:tôi|t|tao|mình)?\s*(.+)",
         lower,
         re.I
     )
@@ -467,56 +429,48 @@ def local_router(text):
         )
 
         content = (
-            match.group(2).strip()
-            or "làm việc"
-        )
-
-        run_time = (
-            datetime.now()
-            + timedelta(
-                hours=hours
-            )
+            match.group(2)
+            .strip()
         )
 
         return {
             "action": "CREATE_REMINDER",
-            "datetime": run_time,
+            "datetime": (
+                datetime.now()
+                + timedelta(
+                    hours=hours
+                )
+            ),
             "content": content
         }
 
-    # =====================================================
-    # REMINDER CẦN AI HIỂU
-    # =====================================================
-
-    reminder_words = [
-        "nhắc",
-        "lịch",
-        "báo tôi",
-        "báo t",
-        "báo tao",
-        "kêu tôi",
-        "kêu t",
-        "đổi lịch",
-        "đổi lại",
-        "sửa lịch",
-    ]
-
-    if any(
-        word in lower
-        for word in reminder_words
-    ):
-
-        return {
-            "action": "AI_REMINDER"
-        }
-
-    return {
-        "action": "CHAT"
-    }
+    return None
 
 
 # =========================================================
-# START COMMAND
+# ABOUT
+# =========================================================
+
+async def about(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = (
+        f"🤖 {BOT_NAME}\n\n"
+        f"👨‍💻 Nhà phát triển: {DEVELOPER}\n"
+        f"📱 Nền tảng: Zalo\n"
+        f"🧠 Phiên bản: 2.0\n\n"
+        f"{COPYRIGHT}"
+    )
+
+    await update.message.reply_text(
+        text
+    )
+
+
+# =========================================================
+# START
 # =========================================================
 
 async def start(
@@ -525,15 +479,10 @@ async def start(
 ):
 
     await update.message.reply_text(
-        "👋 Xin chào!\n\n"
-        "Mình là trợ lý AI cá nhân của bạn.\n"
-        "Bạn có thể:\n"
-        "• Trò chuyện\n"
-        "• Hỏi bài\n"
-        "• Hỏi code\n"
-        "• Đặt lịch nhắc\n"
-        "• Xem lịch\n"
-        "• Lưu thông tin cần nhớ"
+        f"👋 Mình là {BOT_NAME}.\n\n"
+        "Bạn có thể trò chuyện, hỏi bài, hỏi code, "
+        "đặt lịch nhắc hoặc yêu cầu mình ghi nhớ thông tin.\n\n"
+        f"Phát triển bởi {DEVELOPER}."
     )
 
 
@@ -551,230 +500,150 @@ async def restore_command(
     )
 
     await update.message.reply_text(
-        "♻️ Đã kiểm tra và khôi phục lịch."
+        "♻️ Đã kiểm tra lịch."
     )
 
 
 # =========================================================
-# HANDLE MESSAGE
+# REMINDER ACTION
 # =========================================================
 
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+async def process_reminder_action(
+    update,
+    context,
+    user_id,
+    text,
+    result
 ):
 
-    if not update.message:
-        return
-
-    if not update.message.text:
-        return
-
-    text = (
-        update.message.text.strip()
-    )
-
-    user_id = str(
-        update.effective_user.id
-    )
-
-    print()
-    print("============================")
-    print(
-        f"👤 Người dùng: {text}"
-    )
-
-    # =====================================================
-    # LOAD CONTEXT
-    # =====================================================
-
-    history = get_recent_messages(
-        user_id,
-        limit=16
-    )
-
-    memories = get_memories(
-        user_id,
-        limit=20
-    )
-
-    result = local_router(
-        text
-    )
-
     action = result.get(
-        "action",
-        "CHAT"
-    )
-
-    print(
-        f"⚡ LOCAL: {action}"
+        "action"
     )
 
     # =====================================================
-    # SHOW MEMORY
+    # CLARIFY
     # =====================================================
 
-    if action == "SHOW_MEMORY":
+    if action == "CLARIFY":
 
-        if not memories:
+        question = result.get(
+            "question"
+        ) or (
+            "Bạn nói rõ thêm giúp mình nhé."
+        )
 
-            await update.message.reply_text(
-                "Hiện mình chưa lưu thông tin "
-                "lâu dài nào về bạn."
+        state_data = {
+            "original_message": text,
+            "pending_action": result.get(
+                "pending_action"
+            ),
+            "known_content": result.get(
+                "known_content"
             )
+        }
 
-            return
-
-        response = (
-            "🧠 Những điều mình đang nhớ:\n\n"
-        )
-
-        for memory in memories:
-
-            response += (
-                f"• {memory}\n"
+        set_pending_state(
+            user_id,
+            result.get(
+                "pending_action",
+                "REMINDER"
+            ),
+            json.dumps(
+                state_data,
+                ensure_ascii=False
             )
-
-        await update.message.reply_text(
-            response
         )
 
-        return
-
-    # =====================================================
-    # CLEAR MEMORY
-    # =====================================================
-
-    if action == "CLEAR_MEMORY":
-
-        clear_memories(
-            user_id
+        save_message(
+            user_id,
+            "user",
+            text
         )
 
-        await update.message.reply_text(
-            "🧹 Đã xóa bộ nhớ cá nhân."
-        )
-
-        return
-
-    # =====================================================
-    # CLEAR HISTORY
-    # =====================================================
-
-    if action == "CLEAR_HISTORY":
-
-        clear_chat_history(
-            user_id
+        save_message(
+            user_id,
+            "assistant",
+            question
         )
 
         await update.message.reply_text(
-            "🧹 Đã reset lịch sử hội thoại."
+            question
         )
 
-        return
+        return True
 
     # =====================================================
-    # AI REMINDER
-    # =====================================================
-
-    if action == "AI_REMINDER":
-
-        try:
-
-            print(
-                "🧠 AI đang phân tích reminder..."
-            )
-
-            result = await asyncio.to_thread(
-                understand_reminder,
-                text,
-                history
-            )
-
-            action = result.get(
-                "action",
-                "UNKNOWN"
-            )
-
-            print(
-                f"🎯 AI ACTION: {action}"
-            )
-
-        except Exception as e:
-
-            print(
-                f"❌ Reminder AI: {e}"
-            )
-
-            await update.message.reply_text(
-                "Mình chưa hiểu chính xác "
-                "lịch bạn muốn đặt."
-            )
-
-            return
-
-    # =====================================================
-    # CREATE REMINDER
+    # CREATE
     # =====================================================
 
     if action == "CREATE_REMINDER":
 
-        run_time = result.get(
-            "datetime"
+        run_time = parse_datetime(
+            result.get(
+                "datetime"
+            )
         )
-
-        if isinstance(
-            run_time,
-            str
-        ):
-
-            parsed = None
-
-            formats = [
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%d %H:%M",
-            ]
-
-            for fmt in formats:
-
-                try:
-
-                    parsed = datetime.strptime(
-                        run_time,
-                        fmt
-                    )
-
-                    break
-
-                except ValueError:
-
-                    pass
-
-            run_time = parsed
 
         content = (
             result.get(
                 "content"
             )
-            or "làm việc"
-        )
+            or ""
+        ).strip()
+
+        if not content:
+
+            question = (
+                "Bạn muốn mình nhắc việc gì?"
+            )
+
+            set_pending_state(
+                user_id,
+                "CREATE_REMINDER",
+                json.dumps({
+                    "datetime": (
+                        run_time.isoformat()
+                        if run_time
+                        else None
+                    )
+                })
+            )
+
+            await update.message.reply_text(
+                question
+            )
+
+            return True
 
         if not run_time:
 
-            await update.message.reply_text(
-                "Mình chưa hiểu chính xác thời gian."
+            question = (
+                f"Bạn muốn mình nhắc '{content}' "
+                "vào lúc nào?"
             )
 
-            return
+            set_pending_state(
+                user_id,
+                "CREATE_REMINDER",
+                json.dumps({
+                    "content": content
+                }, ensure_ascii=False)
+            )
+
+            await update.message.reply_text(
+                question
+            )
+
+            return True
 
         if run_time <= datetime.now():
 
             await update.message.reply_text(
-                "⏰ Thời gian này đã qua rồi."
+                "Thời gian đó đã qua rồi. "
+                "Bạn muốn đặt vào thời gian nào?"
             )
 
-            return
+            return True
 
         reminder_id = add_reminder(
             user_id,
@@ -788,6 +657,10 @@ async def handle_message(
             reminder_id,
             run_time,
             content
+        )
+
+        clear_pending_state(
+            user_id
         )
 
         answer = (
@@ -812,196 +685,10 @@ async def handle_message(
             answer
         )
 
-        return
+        return True
 
     # =====================================================
-    # UPDATE REMINDER
-    # =====================================================
-
-    if action == "UPDATE_REMINDER":
-
-        reminder = get_last_reminder(
-            user_id
-        )
-
-        if not reminder:
-
-            await update.message.reply_text(
-                "Bạn chưa có lịch nào để sửa."
-            )
-
-            return
-
-        run_time = result.get(
-            "datetime"
-        )
-
-        if isinstance(
-            run_time,
-            str
-        ):
-
-            parsed = None
-
-            formats = [
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%d %H:%M",
-            ]
-
-            for fmt in formats:
-
-                try:
-
-                    parsed = datetime.strptime(
-                        run_time,
-                        fmt
-                    )
-
-                    break
-
-                except ValueError:
-
-                    pass
-
-            run_time = parsed
-
-        if not run_time:
-
-            await update.message.reply_text(
-                "Mình chưa hiểu thời gian mới."
-            )
-
-            return
-
-        if run_time <= datetime.now():
-
-            await update.message.reply_text(
-                "⏰ Thời gian mới đã qua."
-            )
-
-            return
-
-        (
-            reminder_id,
-            _,
-            content
-        ) = reminder
-
-        old_task = running_tasks.get(
-            reminder_id
-        )
-
-        if old_task:
-
-            old_task.cancel()
-
-            running_tasks.pop(
-                reminder_id,
-                None
-            )
-
-        update_reminder(
-            reminder_id,
-            run_time.isoformat()
-        )
-
-        schedule_reminder(
-            context.bot,
-            user_id,
-            reminder_id,
-            run_time,
-            content
-        )
-
-        answer = (
-            f"🔄 Đã đổi lịch sang "
-            f"{run_time.strftime('%d/%m lúc %H:%M')}.\n"
-            f"📝 {content}"
-        )
-
-        save_message(
-            user_id,
-            "user",
-            text
-        )
-
-        save_message(
-            user_id,
-            "assistant",
-            answer
-        )
-
-        await update.message.reply_text(
-            answer
-        )
-
-        return
-
-    # =====================================================
-    # CANCEL REMINDER
-    # =====================================================
-
-    if action == "CANCEL_REMINDER":
-
-        reminder = get_last_reminder(
-            user_id
-        )
-
-        if not reminder:
-
-            await update.message.reply_text(
-                "📭 Bạn không có lịch nào để hủy."
-            )
-
-            return
-
-        (
-            reminder_id,
-            _,
-            content
-        ) = reminder
-
-        task = running_tasks.get(
-            reminder_id
-        )
-
-        if task:
-
-            task.cancel()
-
-            running_tasks.pop(
-                reminder_id,
-                None
-            )
-
-        cancel_reminder(
-            reminder_id
-        )
-
-        answer = (
-            f"🗑️ Đã hủy lịch: {content}"
-        )
-
-        save_message(
-            user_id,
-            "user",
-            text
-        )
-
-        save_message(
-            user_id,
-            "assistant",
-            answer
-        )
-
-        await update.message.reply_text(
-            answer
-        )
-
-        return
-
-    # =====================================================
-    # LIST REMINDERS
+    # LIST
     # =====================================================
 
     if action == "LIST_REMINDER":
@@ -1012,93 +699,38 @@ async def handle_message(
 
         if not reminders:
 
-            await update.message.reply_text(
+            answer = (
                 "📭 Bạn chưa có lịch nhắc nào."
             )
 
-            return
+        else:
 
-        response = (
-            "📅 Lịch hiện tại của bạn:\n\n"
-        )
+            parts = [
+                "📅 Lịch hiện tại:"
+            ]
 
-        for (
-            reminder_id,
-            remind_at,
-            content
-        ) in reminders:
+            for (
+                rid,
+                remind_at,
+                content
+            ) in reminders:
 
-            try:
+                try:
 
-                dt = datetime.fromisoformat(
-                    remind_at
-                )
+                    dt = datetime.fromisoformat(
+                        remind_at
+                    )
 
-                response += (
-                    f"⏰ {dt.strftime('%d/%m %H:%M')}\n"
-                    f"📝 {content}\n\n"
-                )
+                    parts.append(
+                        f"• {dt.strftime('%d/%m %H:%M')} — {content}"
+                    )
 
-            except Exception:
+                except Exception:
+                    pass
 
-                pass
-
-        await update.message.reply_text(
-            response.strip()
-        )
-
-        return
-
-    # =====================================================
-    # NORMAL AI CHAT
-    # =====================================================
-
-    try:
-
-        # ---------------------------------------------
-        # EXPLICIT MEMORY
-        # ---------------------------------------------
-
-        new_memory = extract_explicit_memory(
-            text
-        )
-
-        if new_memory:
-
-            add_memory(
-                user_id,
-                new_memory
+            answer = "\n".join(
+                parts
             )
-
-            memories = get_memories(
-                user_id,
-                limit=20
-            )
-
-        print(
-            "🤖 Gọi Groq..."
-        )
-
-        # ---------------------------------------------
-        # AI
-        # ---------------------------------------------
-
-        answer = await asyncio.to_thread(
-            chat_with_ai,
-            text,
-            history,
-            memories
-        )
-
-        if not answer:
-
-            answer = (
-                "Mình chưa tạo được câu trả lời."
-            )
-
-        # ---------------------------------------------
-        # SAVE HISTORY
-        # ---------------------------------------------
 
         save_message(
             user_id,
@@ -1112,33 +744,564 @@ async def handle_message(
             answer
         )
 
-        # ---------------------------------------------
-        # ZALO MESSAGE LIMIT
-        # ---------------------------------------------
+        await update.message.reply_text(
+            answer
+        )
 
-        chunk_size = 2800
+        return True
 
-        for i in range(
-            0,
-            len(answer),
-            chunk_size
-        ):
+    # =====================================================
+    # CANCEL
+    # =====================================================
+
+    if action == "CANCEL_REMINDER":
+
+        reminder_id = result.get(
+            "reminder_id"
+        )
+
+        if reminder_id:
+
+            reminder = get_reminder_by_id(
+                reminder_id,
+                user_id
+            )
+
+        else:
+
+            reminder = None
+
+        if not reminder:
+
+            reminders = get_user_reminders(
+                user_id
+            )
+
+            if len(reminders) == 1:
+
+                rid, _, content = (
+                    reminders[0]
+                )
+
+                reminder = {
+                    "id": rid,
+                    "content": content
+                }
+
+            elif len(reminders) == 0:
+
+                await update.message.reply_text(
+                    "Bạn không có lịch nào để hủy."
+                )
+
+                return True
+
+            else:
+
+                answer = (
+                    "Bạn muốn hủy lịch nào?\n\n"
+                )
+
+                for (
+                    rid,
+                    remind_at,
+                    content
+                ) in reminders:
+
+                    dt = datetime.fromisoformat(
+                        remind_at
+                    )
+
+                    answer += (
+                        f"• {dt.strftime('%d/%m %H:%M')} "
+                        f"— {content}\n"
+                    )
+
+                set_pending_state(
+                    user_id,
+                    "CANCEL_REMINDER",
+                    ""
+                )
+
+                await update.message.reply_text(
+                    answer.strip()
+                )
+
+                return True
+
+        rid = reminder["id"]
+
+        task = running_tasks.get(
+            rid
+        )
+
+        if task:
+
+            task.cancel()
+
+            running_tasks.pop(
+                rid,
+                None
+            )
+
+        cancel_reminder(
+            rid
+        )
+
+        clear_pending_state(
+            user_id
+        )
+
+        answer = (
+            f"🗑️ Đã hủy lịch: "
+            f"{reminder['content']}."
+        )
+
+        save_message(
+            user_id,
+            "user",
+            text
+        )
+
+        save_message(
+            user_id,
+            "assistant",
+            answer
+        )
+
+        await update.message.reply_text(
+            answer
+        )
+
+        return True
+
+    # =====================================================
+    # UPDATE
+    # =====================================================
+
+    if action == "UPDATE_REMINDER":
+
+        reminder_id = result.get(
+            "reminder_id"
+        )
+
+        run_time = parse_datetime(
+            result.get(
+                "datetime"
+            )
+        )
+
+        if not run_time:
 
             await update.message.reply_text(
-                answer[
-                    i:i + chunk_size
-                ]
+                "Bạn muốn đổi lịch sang mấy giờ?"
             )
+
+            set_pending_state(
+                user_id,
+                "UPDATE_REMINDER",
+                json.dumps({
+                    "reminder_id": reminder_id
+                })
+            )
+
+            return True
+
+        reminder = None
+
+        if reminder_id:
+
+            reminder = get_reminder_by_id(
+                reminder_id,
+                user_id
+            )
+
+        if not reminder:
+
+            reminders = get_user_reminders(
+                user_id
+            )
+
+            if len(reminders) == 1:
+
+                rid, _, content = reminders[0]
+
+                reminder = {
+                    "id": rid,
+                    "content": content
+                }
+
+            elif len(reminders) == 0:
+
+                await update.message.reply_text(
+                    "Bạn chưa có lịch nào để sửa."
+                )
+
+                return True
+
+            else:
+
+                await update.message.reply_text(
+                    "Bạn có nhiều lịch. "
+                    "Bạn muốn đổi lịch nào?"
+                )
+
+                set_pending_state(
+                    user_id,
+                    "UPDATE_REMINDER",
+                    json.dumps({
+                        "datetime": run_time.isoformat()
+                    })
+                )
+
+                return True
+
+        if run_time <= datetime.now():
+
+            await update.message.reply_text(
+                "Thời gian mới đã qua rồi. "
+                "Bạn chọn thời gian khác nhé."
+            )
+
+            return True
+
+        rid = reminder["id"]
+        content = reminder["content"]
+
+        task = running_tasks.get(
+            rid
+        )
+
+        if task:
+
+            task.cancel()
+
+            running_tasks.pop(
+                rid,
+                None
+            )
+
+        update_reminder(
+            rid,
+            run_time.isoformat()
+        )
+
+        schedule_reminder(
+            context.bot,
+            user_id,
+            rid,
+            run_time,
+            content
+        )
+
+        clear_pending_state(
+            user_id
+        )
+
+        answer = (
+            f"🔄 Đã đổi lịch '{content}' sang "
+            f"{run_time.strftime('%d/%m lúc %H:%M')}."
+        )
+
+        save_message(
+            user_id,
+            "user",
+            text
+        )
+
+        save_message(
+            user_id,
+            "assistant",
+            answer
+        )
+
+        await update.message.reply_text(
+            answer
+        )
+
+        return True
+
+    return False
+
+
+# =========================================================
+# MESSAGE
+# =========================================================
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    if not update.message.text:
+        return
+
+    text = (
+        update.message.text
+        .strip()
+    )
+
+    user_id = str(
+        update.effective_user.id
+    )
+
+    print()
+    print("==============================")
+    print(
+        f"👤 {user_id}: {text}"
+    )
+
+    history = get_recent_messages(
+        user_id,
+        limit=24
+    )
+
+    memories = get_memories(
+        user_id,
+        limit=30
+    )
+
+    pending = get_pending_state(
+        user_id
+    )
+
+    reminders = get_user_reminders(
+        user_id
+    )
+
+    # =====================================================
+    # FIXED COMMANDS
+    # =====================================================
+
+    lower = text.lower()
+
+    if lower in (
+        "bạn nhớ gì về tôi",
+        "m nhớ gì về t",
+        "nhớ gì về tôi",
+        "xem bộ nhớ"
+    ):
+
+        if not memories:
+
+            await update.message.reply_text(
+                "Hiện mình chưa lưu thông tin "
+                "dài hạn nào về bạn."
+            )
+
+        else:
+
+            answer = (
+                "🧠 Những điều mình đang nhớ:\n\n"
+                + "\n".join(
+                    f"• {x}"
+                    for x in memories
+                )
+            )
+
+            await update.message.reply_text(
+                answer
+            )
+
+        return
+
+    if lower in (
+        "xóa bộ nhớ",
+        "xoá bộ nhớ",
+        "quên hết đi"
+    ):
+
+        clear_memories(
+            user_id
+        )
+
+        await update.message.reply_text(
+            "🧹 Đã xóa bộ nhớ cá nhân."
+        )
+
+        return
+
+    if lower in (
+        "xóa lịch sử chat",
+        "xoá lịch sử chat",
+        "reset chat"
+    ):
+
+        clear_chat_history(
+            user_id
+        )
+
+        clear_pending_state(
+            user_id
+        )
+
+        await update.message.reply_text(
+            "🧹 Đã reset ngữ cảnh hội thoại."
+        )
+
+        return
+
+    # =====================================================
+    # MEMORY SAVE
+    # =====================================================
+
+    memory = extract_explicit_memory(
+        text
+    )
+
+    if memory:
+
+        added = add_memory(
+            user_id,
+            memory
+        )
+
+        if added:
+
+            answer = (
+                f"🧠 Mình đã ghi nhớ: {memory}"
+            )
+
+        else:
+
+            answer = (
+                "🧠 Thông tin đó mình đã nhớ rồi."
+            )
+
+        save_message(
+            user_id,
+            "user",
+            text
+        )
+
+        save_message(
+            user_id,
+            "assistant",
+            answer
+        )
+
+        await update.message.reply_text(
+            answer
+        )
+
+        return
+
+    # =====================================================
+    # FAST REMINDER
+    # =====================================================
+
+    fast = fast_reminder(
+        text
+    )
+
+    if fast:
+
+        await process_reminder_action(
+            update,
+            context,
+            user_id,
+            text,
+            fast
+        )
+
+        return
+
+    # =====================================================
+    # REMINDER AI
+    #
+    # Nếu đang pending thì dù user chỉ nói "7h",
+    # vẫn phải cho router xử lý.
+    # =====================================================
+
+    if (
+        pending
+        or looks_like_reminder(text)
+    ):
+
+        try:
+
+            result = await asyncio.to_thread(
+                understand_reminder,
+                text,
+                history,
+                pending,
+                reminders
+            )
+
+            action = result.get(
+                "action"
+            )
+
+            if action != "NOT_REMINDER":
+
+                handled = (
+                    await process_reminder_action(
+                        update,
+                        context,
+                        user_id,
+                        text,
+                        result
+                    )
+                )
+
+                if handled:
+                    return
+
+        except Exception as e:
+
+            print(
+                f"❌ Reminder Router: {e}"
+            )
+
+            # Không làm bot chết.
+            # Nếu router lỗi thì cho chat AI xử lý tiếp.
+
+    # =====================================================
+    # NORMAL AI CHAT
+    # =====================================================
+
+    try:
+
+        print(
+            "🤖 Smart chat..."
+        )
+
+        answer = await asyncio.to_thread(
+            chat_with_ai,
+            text,
+            history,
+            memories
+        )
+
+        save_message(
+            user_id,
+            "user",
+            text
+        )
+
+        save_message(
+            user_id,
+            "assistant",
+            answer
+        )
+
+        await send_long_message(
+            update.message,
+            answer
+        )
 
     except Exception as e:
 
         print(
-            f"❌ AI ERROR: {e}"
+            f"❌ CHAT ERROR: {e}"
         )
 
         await update.message.reply_text(
-            "⚠️ AI đang gặp lỗi tạm thời. "
-            "Bạn gửi lại câu hỏi giúp mình nhé."
+            "Mình gặp lỗi khi xử lý câu này. "
+            "Bạn gửi lại giúp mình nhé."
         )
 
 
@@ -1148,41 +1311,33 @@ async def handle_message(
 
 if __name__ == "__main__":
 
-    # -----------------------------------------------------
-    # HTTP SERVER CHO RENDER
-    # -----------------------------------------------------
-
-    web_thread = threading.Thread(
+    # HTTP server Render
+    threading.Thread(
         target=run_web_server,
         daemon=True
-    )
+    ).start()
 
-    web_thread.start()
-
-    # -----------------------------------------------------
-    # DATABASE
-    # -----------------------------------------------------
-
+    # Database
     init_db()
 
-    # -----------------------------------------------------
-    # ZALO BOT
-    # -----------------------------------------------------
-
+    # Zalo
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    # -----------------------------------------------------
-    # HANDLERS
-    # -----------------------------------------------------
-
     app.add_handler(
         CommandHandler(
             "start",
             start
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "about",
+            about
         )
     )
 
@@ -1206,30 +1361,35 @@ if __name__ == "__main__":
         "=========================================="
     )
     print(
-        "🤖 ZALO PERSONAL AI"
+        f"🤖 {BOT_NAME} v2.0"
     )
     print(
-        "⚡ Groq AI             : ON"
+        f"👨‍💻 Developer: {DEVELOPER}"
     )
     print(
-        "🧠 Conversation Memory : ON"
+        "🧠 Smart Context        : ON"
     )
     print(
-        "💾 SQLite              : ON"
+        "🧠 Long-term Memory     : ON"
     )
     print(
-        "⏰ Reminder             : ON"
+        "❓ Clarification        : ON"
     )
     print(
-        "🌐 Render HTTP Server  : ON"
+        "⏰ Smart Reminder       : ON"
+    )
+    print(
+        "⚡ Groq                 : ON"
+    )
+    print(
+        "🌐 Render               : ON"
     )
     print(
         "=========================================="
     )
+    print(
+        COPYRIGHT
+    )
     print()
-
-    # -----------------------------------------------------
-    # START
-    # -----------------------------------------------------
 
     app.run_polling()
